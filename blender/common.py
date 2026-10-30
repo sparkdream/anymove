@@ -8,7 +8,7 @@ what makes two views enough for 3D and what the sync check measures.
 The creature is chosen with MOCAP_CREATURE=<assets dir>, whose creature.json can set its own framing (a dragon's
 wingspan needs a wider front view) and limb paint groups. Without it, the wolf's settings below apply.
 """
-import json, math, os, pathlib
+import ctypes.util, json, math, os, pathlib
 
 import bpy
 import numpy as np
@@ -23,6 +23,8 @@ LEG_BONES = {"FL": ["upperarm_L", "forearm_L", "metacarpus_L", "fpaw_L"],
              "FR": ["upperarm_R", "forearm_R", "metacarpus_R", "fpaw_R"],
              "HL": ["thigh_L", "shin_L", "metatarsus_L", "hpaw_L"],
              "HR": ["thigh_R", "shin_R", "metatarsus_R", "hpaw_R"]}
+# Cycles' GPU backend: CUDA, OPTIX, HIP, ONEAPI (Intel) or METAL; anything else, or no such device, renders on the CPU
+CYCLES_DEVICE = os.environ.get("CYCLES_DEVICE", "CUDA")
 CREATURE = os.environ.get("MOCAP_CREATURE")
 if CREATURE and (pathlib.Path(CREATURE) / "creature.json").exists():
     _c = json.load(open(pathlib.Path(CREATURE) / "creature.json"))
@@ -150,14 +152,20 @@ def camera_json(cam, w, h):
 
 
 def studio(scene, samples=32, seed=None):
-    """Cycles on CUDA, transparent film, Standard view transform (keeps the leg paint saturated), three suns."""
+    """Cycles on the GPU (CYCLES_DEVICE), transparent film, Standard view transform (keeps the leg paint saturated),
+    three suns."""
     scene.render.engine = "CYCLES"
     prefs = bpy.context.preferences.addons["cycles"].preferences
-    prefs.compute_device_type = "CUDA"
+    try:
+        prefs.compute_device_type = CYCLES_DEVICE
+    except TypeError:  # not a backend this Blender build has
+        prefs.compute_device_type = "NONE"
+    if CYCLES_DEVICE == "ONEAPI":  # hardware ray tracing needs the intel-level-zero-gpu-raytracing package
+        prefs.use_oneapirt = ctypes.util.find_library("ze_intel_gpu_raytracing") is not None
     prefs.get_devices()
     for d in prefs.devices:
-        d.use = d.type == "CUDA"
-    scene.cycles.device = "GPU"
+        d.use = d.type == CYCLES_DEVICE
+    scene.cycles.device = "GPU" if any(d.use for d in prefs.devices) else "CPU"
     scene.cycles.samples = samples
     scene.cycles.use_denoising = True
     scene.cycles.max_bounces = 4

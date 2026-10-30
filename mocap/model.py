@@ -15,6 +15,15 @@ MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
+def device():
+    """The GPU to run on: CUDA, else an Intel GPU (xpu), else the CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
 class JointReader(nn.Module):
     def __init__(self, n_joints, backbone=BACKBONE):
         super().__init__()

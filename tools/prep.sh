@@ -1,11 +1,11 @@
 #!/bin/bash
 # Once per creature, step 1: scale the mesh to real size and stand it on the ground, then draw side, front and top
 # views with a 10 cm grid (and rig.json's joints, if there is one) for placing the skeleton.
-# tools/prep.sh CREATURE      reads assets/CREATURE/model.glb and creature.json "prep": length_m, rotz_deg, axis
+# tools/prep.sh CREATURE      reads CREATURE's model.glb and creature.json "prep": length_m, rotz_deg, axis
 set -euo pipefail
 source "$(dirname "$0")/_env.sh"
 need_creature "${1:-}"
-a=assets/$1
+a=$A
 read -r len rot axis < <($PY -c "import json; p = json.load(open('$a/creature.json')).get('prep', {}); print(p.get('length_m', 1.0), p.get('rotz_deg', 0), p.get('axis', 'y'))")
 $BLENDER -b -P blender/prep_mesh.py -- "$a/model.glb" "$len" "$a/prep" "$rot" "$axis" | grep -E "^size|^saved|Error" || true
 $BLENDER -b -P blender/ortho_views.py -- "$a/prep/static.blend" "$a/prep/views" 300 | grep -E "^views|Error" || true

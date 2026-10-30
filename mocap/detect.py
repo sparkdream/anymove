@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from mocap import layout
-from mocap.model import HM, SIZE, JointReader, decode, square
+from mocap.model import HM, SIZE, JointReader, decode, device, square
 
 
 def read_frames(path):
@@ -58,8 +58,9 @@ def run(model, views, bs=32):
     uv_all, conf_all = [], []
     for i in range(0, len(views), bs):
         batch = [prep(v) for v in views[i:i + bs]]
-        x = torch.from_numpy(np.stack([b[0] for b in batch])).permute(0, 3, 1, 2).float().cuda() / 255
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        dev = next(model.parameters()).device
+        x = torch.from_numpy(np.stack([b[0] for b in batch])).permute(0, 3, 1, 2).float().to(dev) / 255
+        with torch.autocast(dev.type, dtype=torch.bfloat16):
             hm = model(x).float()
         uv, conf = decode(hm)
         uv = uv.cpu().numpy() * SIZE / HM
@@ -71,7 +72,7 @@ def run(model, views, bs=32):
 
 def load(model_path):
     ck = torch.load(model_path, map_location="cpu", weights_only=True)  # tensors, names and numbers only: safe for downloaded readers
-    model = JointReader(len(ck["names"])).cuda().eval()
+    model = JointReader(len(ck["names"])).to(device()).eval()
     model.load_state_dict(ck["state_dict"])
     return model, ck["names"]
 

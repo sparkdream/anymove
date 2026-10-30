@@ -90,6 +90,9 @@ tools/film.sh <name> <move>       # after tools/make_prompt.py writes prompts/<n
 tools/capture.sh <name> runs/<name>/videos/<move>/s1/h3max.mp4 <move>
 ```
 
+A creature can also live outside the repo: give the scripts its folder instead of a name (anything with a `/`, such as
+`../my-creatures/fox`), and its outputs go to `runs/` and its prompts to `prompts/` inside that folder.
+
 The skills below walk an agent (or you) through each step, with the checks that tell a good capture from a bad one.
 
 ## agent skills.

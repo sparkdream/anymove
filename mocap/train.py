@@ -5,7 +5,7 @@ Every sample gives two training images (front and side). The renders are transpa
 fresh random backdrop, then jittered in framing, colour, sharpness and compression, the ways a video model's frames
 differ from a clean render. Holds out 4% of samples and reports their mean joint error in layout pixels.
 """
-import json, math, pathlib, sys, time
+import json, math, os, pathlib, sys, time
 
 import cv2
 import numpy as np
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from mocap import layout
-from mocap.model import HM, SIZE, JointReader, decode, square
+from mocap.model import HM, SIZE, JointReader, decode, device, square
 
 
 def backdrop(h, w, ground, rng):
@@ -117,8 +117,9 @@ def main():
 
     train, val = split()
     print(f"{len(train)} train / {len(val)} val samples so far, {len(names)} joints", flush=True)
-    vl = DataLoader(Views(val, False), batch_size=bs, num_workers=4)
-    dev = "cuda"
+    cpus = len(os.sched_getaffinity(0))  # no more loader workers than the CPUs this process may run on
+    vl = DataLoader(Views(val, False), batch_size=bs, num_workers=min(4, cpus))
+    dev = device()
     model = JointReader(len(names)).to(dev)
     head = [p for n, p in model.named_parameters() if not n.startswith("backbone")]
     opt = torch.optim.AdamW([{"params": model.backbone.parameters(), "lr": 2e-5},
@@ -127,7 +128,7 @@ def main():
     step, t0, warm = 0, time.time(), 300
     for ep in range(epochs):
         train, _ = split()
-        dl = DataLoader(Views(train, True), batch_size=bs, shuffle=True, num_workers=10, drop_last=True)
+        dl = DataLoader(Views(train, True), batch_size=bs, shuffle=True, num_workers=min(10, cpus), drop_last=True)
         print(f"epoch {ep}: {len(train)} train samples", flush=True)
         model.train()
         for bi_, (x, kp, _) in enumerate(dl):
@@ -135,7 +136,7 @@ def main():
             for g, b0 in zip(opt.param_groups, base):
                 g["lr"] = b0 * f
             x, kp = x.to(dev, non_blocking=True), kp.to(dev, non_blocking=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(dev, dtype=torch.bfloat16):
                 pred = model(x)
             loss = F.mse_loss(pred.float(), heatmaps(kp)) * 1000
             opt.zero_grad(set_to_none=True)
@@ -149,7 +150,7 @@ def main():
         errs = {"front": [], "side": []}
         with torch.no_grad():
             for bi, (x, kp, geo) in enumerate(vl):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(dev, dtype=torch.bfloat16):
                     pred = model(x.to(dev)).float()
                 uv, _ = decode(pred)
                 uv = uv.cpu() * SIZE / HM

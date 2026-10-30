@@ -105,7 +105,8 @@ def align_views(d, names, band=48, step_penalty=1.0):
 
 
 def feet():
-    """The joints whose heights make the sync score: creature.json "feet" when MOCAP_CREATURE is set, else the wolf's."""
+    """The joints whose heights make the sync score, and that the fit keeps above the ground: creature.json "feet" when
+    MOCAP_CREATURE is set, else the wolf's."""
     import os, pathlib
     cfg = pathlib.Path(os.environ.get("MOCAP_CREATURE", "")) / "creature.json"
     if os.environ.get("MOCAP_CREATURE") and cfg.exists():
@@ -321,7 +322,8 @@ def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25):
     e0 = torch.tensor(ik_init(tri_np, root0, info, rig), dtype=torch.float64, device=dev)
     z = ((e0 - rig.lo) / (rig.hi - rig.lo)).clamp(1e-3, 1 - 1e-3)
     phi = torch.logit(z).clone().requires_grad_(True)
-    paws = [names.index(n) for n in names if any(n.startswith(p) for p in ("fpaw", "ftoe", "hpaw", "htoe"))]
+    foot = set(feet())
+    paws = [i for i, n in enumerate(names) if n in foot or any(n.startswith(p) for p in ("fpaw", "ftoe", "hpaw", "htoe"))]
     sigma = 6.0  # px, robust scale (annealed down from 40 px so far-off joints still pull early on)
     # The side view sees legs swing and the hips clearly; the front view foreshortens leg lifts and hides the hips
     # when the creature sits, and video models animate it less faithfully. So heights come mostly from the side

@@ -101,6 +101,37 @@ mask = np.zeros_like(W, bool)
 np.put_along_axis(mask, keep, True, axis=1)
 W = np.where(mask, W, 0)
 W /= W.sum(1, keepdims=True).clip(1e-9)
+
+# Loose pieces (a buckle, a button the generator left floating off the surface) get weights from whatever bones the heat
+# solve reached. Give every vertex of a small piece the weights of the closest vertex of the main body instead, so
+# the piece moves rigidly with the surface it sits on.
+parent = list(range(nv))
+
+
+def find(i):
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+
+for a, b in E:
+    ra, rb = find(int(a)), find(int(b))
+    if ra != rb:
+        parent[ra] = rb
+piece = np.array([find(i) for i in range(nv)])
+ids, counts = np.unique(piece, return_counts=True)
+co = np.array([v.co[:] for v in body.data.vertices])
+main = np.nonzero(piece == ids[counts.argmax()])[0]
+loose = 0
+for pid, n in zip(ids, counts):
+    if n < 0.02 * nv:
+        idx = np.nonzero(piece == pid)[0]
+        sub = idx[:: max(1, len(idx) // 64)]
+        d = ((co[sub, None] - co[None, main]) ** 2).sum(-1)
+        W[idx] = W[main[d.min(0).argmin()]]
+        loose += 1
+print("loose pieces moving with the nearest surface:", loose)
 for gi, vg in enumerate(body.vertex_groups):
     vg.remove(list(range(nv)))
     idx = np.nonzero(W[:, gi] > 1e-4)[0]

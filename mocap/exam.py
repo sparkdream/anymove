@@ -69,7 +69,8 @@ def video(render_dir, out, fps=24):
     print("video", out, len(fr), "frames")
 
 
-GROUPS = {"paws": ("fpaw", "ftoe", "hpaw", "htoe"), "legs": ("elbow", "wrist", "knee", "hock", "shoulder", "hip_", "scap"),
+GROUPS = {"paws": ("fpaw", "ftoe", "hpaw", "htoe", "ankle", "ball", "toetip", "handtip"),
+          "legs": ("elbow", "wrist", "knee", "hock", "shoulder", "hip_", "scap", "clav"),
           "spine": ("hips", "spine", "chest"), "head": ("neck", "head", "nose"), "tail": ("tail",)}
 
 
@@ -83,7 +84,8 @@ def score(truth_path, solved_path):
     out = {"mean_cm": float(e.mean()), "median_cm": float(np.median(e)), "p95_cm": float(np.percentile(e, 95))}
     for g, keys in GROUPS.items():
         idx = [i for i, n in enumerate(names) if any(n.startswith(k) for k in keys)]
-        out[f"{g}_cm"] = float(e[:, idx].mean())
+        if idx:
+            out[f"{g}_cm"] = float(e[:, idx].mean())
     worst = np.argsort(-e.mean(0))[:5]
     out["worst_joints"] = {names[i]: round(float(e[:, i].mean()), 2) for i in worst}
     print(json.dumps(out, indent=1))
