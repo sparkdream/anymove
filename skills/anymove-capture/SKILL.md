@@ -12,7 +12,8 @@ tools/capture.sh <c> runs/<c>/videos/roar/s1/h3max.mp4 roar
 ```
 
 Writes `runs/<c>/clips/roar/`: `det.npz` (every joint in both views, every frame), `overlay.mp4` (the joints drawn on
-the clip), `motion.json` (the fit: root path and rotation, Euler angles per bone, joints in metres),
+the clip), `motion_raw.json` (the fit: root path and rotation, Euler angles per bone, joints in metres), `motion.json` (the fit
+cleaned up: see step 4),
 `render/animation.glb` (the rig with the animation, for any engine), `render/persp` and `render/side` frames, and
 `showcase.mp4` (the AI clip with joints, the rig in 3/4, and clip vs rig through the same side camera).
 
@@ -28,7 +29,11 @@ the clip), `motion.json` (the fit: root path and rotation, Euler angles per bone
    once. Heights come mostly from the side view (the front view foreshortens leg lifts), left-right from the front
    view. It starts from an analytic IK pose aimed at the triangulated joints and anneals a robust loss from 40 px to
    6 px, so big poses (sit, rear, slam) are found. Under a minute for 5 s (20 s for the dragon's roar on a CPU).
-4. **Export.** Blender keys the rig, writes the GLB and renders the views.
+4. **Clean up.** `mocap/clean.py` holds a limb the reader lost in one view (an arm behind the other one), holds a
+   limb once its move has settled (the hand stops wobbling after a strike), and smooths only the tracks the reader
+   was unsure of. It prints what it held and the reprojection error after; a higher error there is expected where a
+   lost limb is held. `CLEAN="--no-settle"` (or `--no-occlusion`, `--no-smooth`, `--off`) turns parts off.
+5. **Export.** Blender keys the rig, writes the GLB and renders the views.
 
 ## Is it good? Read the solve output
 

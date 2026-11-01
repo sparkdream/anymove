@@ -96,6 +96,41 @@ for _ in range(3):
     np.add.at(acc, E[:, 0], W[E[:, 1]])
     np.add.at(acc, E[:, 1], W[E[:, 0]])
     W = 0.5 * W + 0.5 * acc / deg
+
+# The heat solve can spill a limb's weights far onto the body (an arm hanging against a long coat drags the coat's
+# front with it when it swings across). Fade each limb bone's weight out with the distance from that bone, 5 to 10%
+# of the creature's length, and hand it to the vertex's other bones; a vertex left with nothing goes to the nearest
+# body bone.
+co = np.array([v.co[:] for v in body.data.vertices])
+size = np.ptp(co, axis=0).max()
+parents = {b[0]: b[3] for b in bones}
+limb = {n for chain in common.LEG_BONES.values() for n in chain if n in names}
+for n in names:  # and everything hanging off a limb (a blade, a hoof)
+    p = parents[n]
+    while p and n not in limb:
+        if p in limb:
+            limb.add(n)
+        p = parents[p]
+
+
+def seg_dist(i):
+    a, b = segs[i]
+    t = np.clip(((co - a) @ (b - a)) / max((b - a) @ (b - a), 1e-12), 0, 1)
+    return np.linalg.norm(a + (b - a) * t[:, None] - co, axis=1)
+
+
+gi = {g.name: g.index for g in body.vertex_groups}
+before = W.copy()
+for n in limb:
+    if n in gi:
+        W[:, gi[n]] *= np.clip((0.10 * size - seg_dist(names.index(n))) / (0.05 * size), 0, 1)
+empty = W.sum(1) < 1e-3
+if empty.any():
+    body_bones = [i for i, n in enumerate(names) if n not in limb and n in gi]
+    d = np.stack([seg_dist(i)[empty] for i in body_bones], 1)
+    W[np.nonzero(empty)[0], [gi[names[body_bones[j]]] for j in d.argmin(1)]] = 1.0
+moved = (before - W).clip(0).sum(1) > 0.05
+print(f"limb weight pulled back from {int(moved.sum())} vertices far from their limb ({int(empty.sum())} reassigned)")
 keep = np.argsort(-W, axis=1)[:, :4]
 mask = np.zeros_like(W, bool)
 np.put_along_axis(mask, keep, True, axis=1)

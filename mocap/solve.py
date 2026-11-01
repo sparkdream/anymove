@@ -1,6 +1,6 @@
 """Fit the rig to the joints read from both views: one pose per frame, smooth over time, inside the joint limits.
 
-python -m mocap.solve DETECTIONS.npz rig_info.json OUT.json
+python -m mocap.solve DETECTIONS.npz rig_info.json OUT.json [--no-align] [--fix-swaps] [--acc WEIGHT]
 Before fitting, the side view's left and right legs are checked against the front view: a joint has the same height
 in both halves, so if swapping a pair of legs in the side view makes the heights agree better, the side reader
 mixed up the near and far leg and they are swapped back. The same height test gives the sync score: how far apart
@@ -302,7 +302,9 @@ def ik_init(tri, root_aa, info, rig):
     return eul
 
 
-def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25):
+def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_weight=0.02):
+    """acc_weight: the joint-acceleration penalty. Lower it for fast moves with long levers (a blade tip in a slash
+    moves faster than anything else and gets held back first): 0.002 follows them far better."""
     rig = Rig(info, dev)
     names = rig.kp_names
     T = len(d["front_uv"])
@@ -338,7 +340,7 @@ def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25):
         rf = ((pf - f_obs) ** 2 * f_axis).sum(-1)
         rs = ((ps - s_obs) ** 2).sum(-1)
         data = (f_c * torch.log1p(rf / sigma ** 2)).sum() + (s_c * torch.log1p(rs / sigma ** 2)).sum()
-        acc = ((J[2:] - 2 * J[1:-1] + J[:-2]) ** 2).sum() / layout.M_PER_PX ** 2 * 0.02
+        acc = ((J[2:] - 2 * J[1:-1] + J[:-2]) ** 2).sum() / layout.M_PER_PX ** 2 * acc_weight
         vel = ((eul[1:] - eul[:-1]) ** 2).sum() * 2.0 + ((root[1:] - root[:-1]) ** 2).sum() * 2.0
         prior = (eul ** 2).sum() * 0.05
         ground = (torch.relu(-J[:, paws, 2]) ** 2).sum() / layout.M_PER_PX ** 2 * 0.5
@@ -411,7 +413,8 @@ def main():
     sync["before"] = {k: v for k, v in before.items() if k != "per_frame_gap_px"}
     sync["paw_agreement"] = paws
     sync["front_shift_frames"] = None if shift is None else shift.round(2).tolist()
-    res = fit(d, info, dev="cuda" if torch.cuda.is_available() else "cpu")
+    acc = float(sys.argv[sys.argv.index("--acc") + 1]) if "--acc" in sys.argv else 0.02
+    res = fit(d, info, dev="cuda" if torch.cuda.is_available() else "cpu", acc_weight=acc)
     print("reprojection error px:", {k: round(v, 2) for k, v in res["reproj_px"].items()})
     motion = {"fps": float(raw["fps"]), "bones": res["bones"], "trans": res["trans"].round(5).tolist(),
               "root_quat": to_quat(res["root_rotmat"]).round(6).tolist(), "euler": res["euler"].round(5).tolist(),

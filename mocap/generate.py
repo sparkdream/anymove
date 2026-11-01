@@ -1,12 +1,13 @@
-"""Send one two-camera reference frame and a prompt to several video models on fal, in parallel.
+"""Send one two-camera reference frame and a prompt to several video models on fal, in parallel, and to the local ones.
 
-python -m mocap.generate REF.png PROMPT.txt OUT_DIR [h3,h3max,seedance] [seconds] [seed]
-Each model's clip lands in OUT_DIR/<model>.mp4 with its request in OUT_DIR/<model>.json.
+python -m mocap.generate REF.png PROMPT.txt OUT_DIR [h3,h3max,seedance,wan22,wan22-14b] [seconds] [seed]
+Each model's clip lands in OUT_DIR/<model>.mp4; a fal model's request also goes to OUT_DIR/<model>.json. The wan22
+models run on this machine's GPU (mocap/wan.py), one clip at a time.
 """
-import json, pathlib, sys
+import functools, json, multiprocessing, pathlib, sys
 from concurrent.futures import ThreadPoolExecutor
 
-from mocap import fal
+from mocap import fal, wan
 
 MODELS = {
     "h3": ("minimax/h3/image-to-video",
@@ -20,6 +21,7 @@ MODELS = {
     "flux3max": ("blackforestlabs/flux-3-max/image-to-video",
                  lambda p, u, s: {"prompt": p, "image_url": u, "duration": s, "resolution": "720p", "generate_audio": False}),
 }
+LOCAL = {name: functools.partial(wan.generate, model=name) for name in wan.MODELS}
 
 
 def one(name, prompt, url, seconds, out, seed=None):
@@ -46,8 +48,15 @@ if __name__ == "__main__":
     seed = int(sys.argv[6]) if len(sys.argv) > 6 else None
     out = pathlib.Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    url = fal.upload(ref)
     prompt = pathlib.Path(prompt_file).read_text().strip()
-    with ThreadPoolExecutor(len(names)) as ex:
+    remote = [n for n in names if n not in LOCAL]
+    with ThreadPoolExecutor(max(1, len(remote))) as ex:
+        if remote:
+            url = fal.upload(ref)
+            for n in remote:
+                ex.submit(one, n, prompt, url, seconds, out, seed)
         for n in names:
-            ex.submit(one, n, prompt, url, seconds, out, seed)
+            if n in LOCAL:  # each in its own process: the pipeline leaves GPU memory behind that only an exit frees
+                p = multiprocessing.get_context("spawn").Process(target=LOCAL[n], args=(ref, prompt, out / f"{n}.mp4", seconds, seed))
+                p.start()
+                p.join()

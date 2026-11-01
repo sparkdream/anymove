@@ -40,7 +40,8 @@ it, every module falls back to the wolf's layout (420 + 860 px, 1.9 m of height 
 | dataset | `blender/render_dataset.py` | rigged.blend + rig_info.json | `runs/<c>/dataset/<i>_{front,side}.png`, `<i>_meta.json` (true joints in metres and layout px) |
 | reader | `mocap/model.py`, `mocap/train.py` | dataset | `runs/<c>/reader.pt` (state dict, joint names, held-out error) |
 | read | `mocap/detect.py` | clip + reader + ref.png | `det.npz`: `front_uv`, `side_uv` (T x J x 2, layout px), `front_conf`, `side_conf`, `fps`, `names`, `calib` |
-| fit | `mocap/solve.py` | det.npz + rig_info.json | `motion.json`: `bones`, `trans`, `root_quat`, `euler` (T x B x 3), `joints` (T x J x 3 m), `reproj_px`, `sync` (incl. `paw_agreement`) |
+| fit | `mocap/solve.py` | det.npz + rig_info.json | `motion_raw.json`: `bones`, `trans`, `root_quat`, `euler` (T x B x 3), `joints` (T x J x 3 m), `reproj_px`, `sync` (incl. `paw_agreement`) |
+| clean | `mocap/clean.py` | det.npz + rig_info.json + motion_raw.json | `motion.json`: the same fields, with limbs the reader lost and settled poses held, unsure tracks smoothed; `clean` (what was held, frames), `reproj_px_raw` |
 | apply | `blender/apply_motion.py` | rigged.blend + motion.json | keyframed rig, `joints.json` (true joint positions from Blender), renders, `animation.glb` |
 | compare | `mocap/showcase.py` | clip + det.npz + renders | `showcase.mp4` |
 | exam | `mocap/exam.py` | rig_info.json | a random motion, its two-camera video, and a per-joint error score in cm |
@@ -64,6 +65,21 @@ that cuts the height gap by 15% or more. Joints are triangulated (x from the fro
 root bone, and an analytic IK pose aimed at the triangulated joints is the starting point. The loss is a robust
 (Cauchy) reprojection error in both views, its scale annealed from 40 px to 6 px over the first 60% of 1,500 Adam
 steps, plus joint acceleration, angular velocity, a small pull to rest, and a ground term for paws.
+
+## Inside the clean-up
+
+`mocap/clean.py` splits the rig into chains, each from a branch point (pelvis, chest) out to a tip, plus the trunk.
+It makes three corrections, each with its own switch (`--no-occlusion`, `--no-settle`, `--no-smooth`; `--off` copies
+the raw fit):
+
+- Occlusion: when a chain's far half is read in either view below 0.6 of its usual confidence (its own 90th
+  percentile) for 6 frames or more, it holds its last clearly read pose (above 0.8) and eases back if it is read
+  again. The other view tends to guess confidently at a limb it cannot see either.
+- Settle: when a chain's joints, leaving out its last bone, all move less than `--still` body heights a second
+  (0.045) for 4 frames, the chain holds that pose. The trunk and root hold only where every chain holds.
+- Smoothing: each bone gets a Gaussian up to 2 frames wide, scaled by how far the confidence on the keypoints placing
+  it falls below their usual level, and narrowed in fast turns. Clearly read tracks are left alone: on the exam,
+  plain smoothing of every track tripled the error, while this leaves it unchanged (0.77 cm).
 
 ## Known gaps in the code
 

@@ -24,6 +24,7 @@ LEG_BONES = {"FL": ["upperarm_L", "forearm_L", "metacarpus_L", "fpaw_L"],
              "HL": ["thigh_L", "shin_L", "metatarsus_L", "hpaw_L"],
              "HR": ["thigh_R", "shin_R", "metatarsus_R", "hpaw_R"]}
 # Cycles' GPU backend: CUDA, OPTIX, HIP, ONEAPI (Intel) or METAL; anything else, or no such device, renders on the CPU
+PAINT_THRESHOLD = {}  # per limb, over limb_paint's default
 CYCLES_DEVICE = os.environ.get("CYCLES_DEVICE", "CUDA")
 CREATURE = os.environ.get("MOCAP_CREATURE")
 if CREATURE and (pathlib.Path(CREATURE) / "creature.json").exists():
@@ -35,6 +36,8 @@ if CREATURE and (pathlib.Path(CREATURE) / "creature.json").exists():
     if "paint" in _c:
         LEG_COLORS = {k: v["color"] for k, v in _c["paint"].items()}
         LEG_BONES = {k: v["bones"] for k, v in _c["paint"].items()}
+        # a limb whose weights bleed onto the torso (a sleeve's into the coat) can ask for a higher bar
+        PAINT_THRESHOLD = {k: v["threshold"] for k, v in _c["paint"].items() if "threshold" in v}
 Z_CENTER = (GROUND_V - H / 2) * M_PER_PX
 LAYOUT = {"H": H, "W_FRONT": W_FRONT, "W_SIDE": W_SIDE, "M_PER_PX": M_PER_PX, "GROUND_V": GROUND_V,
           "Z_CENTER": Z_CENTER, "Y_CENTER": 0.0, "X_CENTER": 0.0}
@@ -68,9 +71,31 @@ def srgb_to_linear(hexcol):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
-def paint_legs(body, threshold=0.55):
-    """Colour each leg from the shoulder or hip down to the paw, as a color attribute mixed over the texture."""
-    idx = {g.name: g.index for g in body.vertex_groups}
+def loose_vertices(body, share=0.02):
+    """Vertices of the pieces with under `share` of the mesh's vertices (bits the generator left floating)."""
+    n = len(body.data.vertices)
+    e = np.zeros(len(body.data.edges) * 2, dtype=np.int64)
+    body.data.edges.foreach_get("vertices", e)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b in e.reshape(-1, 2):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[ra] = rb
+    piece = np.array([find(i) for i in range(n)])
+    ids, counts = np.unique(piece, return_counts=True)
+    return np.isin(piece, ids[counts < share * n])
+
+
+def limb_paint(body, threshold=0.55, skip_loose=False):
+    """Per-vertex RGBA of the leg paint: each leg's colour where its bones' weights pass `threshold` (or the leg's own
+    in PAINT_THRESHOLD)."""
     n = len(body.data.vertices)
     w = {leg: np.zeros(n) for leg in LEG_BONES}
     for v in body.data.vertices:
@@ -78,11 +103,19 @@ def paint_legs(body, threshold=0.55):
             for leg, names in LEG_BONES.items():
                 if body.vertex_groups[g.group].name in names:
                     w[leg][v.index] += g.weight
+    keep = ~loose_vertices(body) if skip_loose else np.ones(n, bool)
     rgba = np.zeros((n, 4))
     for leg, col in LEG_COLORS.items():
-        m = w[leg] > threshold
+        m = (w[leg] > PAINT_THRESHOLD.get(leg, threshold)) & keep
         rgba[m, :3] = srgb_to_linear(col)
         rgba[m, 3] = 1.0
+    print("painted vertices", {leg: int(((w[leg] > PAINT_THRESHOLD.get(leg, threshold)) & keep).sum()) for leg in w})
+    return rgba
+
+
+def paint_legs(body, threshold=0.55):
+    """Colour each leg from the shoulder or hip down to the paw, as a color attribute mixed over the texture."""
+    rgba = limb_paint(body, threshold)
     attr = body.data.color_attributes.get("legpaint") or body.data.color_attributes.new("legpaint", "FLOAT_COLOR", "POINT")
     attr.data.foreach_set("color", rgba.ravel())
     for slot in body.material_slots:
@@ -100,7 +133,6 @@ def paint_legs(body, threshold=0.55):
             mix.inputs["A"].default_value = bsdf.inputs["Base Color"].default_value
         nt.links.new(ca.outputs["Color"], mix.inputs["B"])
         nt.links.new(mix.outputs["Result"], bsdf.inputs["Base Color"])
-    print("painted vertices", {leg: int((w[leg] > threshold).sum()) for leg in w})
 
 
 def write_rig_info(arm, joints, bones, limits, path):
