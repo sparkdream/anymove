@@ -97,7 +97,9 @@ def turn_speed(R, fps):
 def clean(d, info, m, occlusion=True, settle=True, smooth=True, still=0.045, occluded=0.6):
     rig = Rig(info)
     fps = m["fps"]
-    E = np.unwrap(np.array(m["euler"]), axis=0)
+    # not unwrapped: the fit keeps every angle inside its limits, so a jump is a real one (an arm swung across the
+    # body by 200 degrees of one Euler angle), and unwrapping it pushed the arm out of its range for the rest of the clip
+    E = np.array(m["euler"])
     trans, q = np.array(m["trans"]), np.array(m["root_quat"])
     for t in range(1, len(q)):  # one hemisphere, so averaging quaternions is meaningful
         if (q[t] * q[t - 1]).sum() < 0:

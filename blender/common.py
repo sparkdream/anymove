@@ -47,8 +47,15 @@ def mirror(name):
     return name[:-2] + "_R" if name and name.endswith("_L") else name
 
 
+def mirror_any(name):
+    """_L to _R and _R to _L."""
+    return name[:-2] + "_L" if name.endswith("_R") else mirror(name)
+
+
 def load_rig(path):
-    """Joints and bones from rig.json with every _L mirrored to _R, and per-bone Euler limits in degrees."""
+    """Joints and bones from rig.json with every _L mirrored to _R, and per bone its limits: Euler limits in degrees
+    and, where rig.json's twist_deg gives one, the most the bone may turn about its own axis (and grip_deg: a held prop
+    re-gripped at that angle off its hand, build_rig.py)."""
     rig = json.load(open(path))
     joints = dict(rig["joints"])
     for k, v in rig["joints"].items():
@@ -60,9 +67,17 @@ def load_rig(path):
         if b[0].endswith("_L"):
             bones.append([mirror(x) for x in b])
     limits = {}
+    twist = rig.get("twist_deg", {})
+    grip = rig.get("grip_deg", {})
     for name, *_ in bones:
         key = name if name in rig["limits_deg"] else name[:-2]
-        limits[name] = rig["limits_deg"][key]
+        limits[name] = {"limits_deg": rig["limits_deg"][key]}
+        key = name if name in twist else name[:-2]
+        if key in twist:
+            limits[name]["twist_deg"] = twist[key]
+        key = name if name in grip else name[:-2]
+        if key in grip:
+            limits[name]["grip_deg"] = grip[key]
     return joints, bones, limits
 
 
@@ -143,7 +158,7 @@ def write_rig_info(arm, joints, bones, limits, path):
         bb = arm.data.bones[name]
         info["bones"].append({"name": name, "parent": order.index(parent) if parent else -1,
                               "matrix_local": [list(r) for r in bb.matrix_local], "length": bb.length,
-                              "head_joint": h, "tail_joint": t, "limits_deg": limits[name]})
+                              "head_joint": h, "tail_joint": t, **limits[name]})
     for j in joints:
         src = next(((i, "head") for i, b in enumerate(bones) if b[1] == j), None) or \
               next(((i, "tail") for i, b in enumerate(bones) if b[2] == j), None)

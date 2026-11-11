@@ -1,14 +1,21 @@
 """Fit the rig to the joints read from both views: one pose per frame, smooth over time, inside the joint limits.
 
-python -m mocap.solve DETECTIONS.npz rig_info.json OUT.json [--no-align] [--fix-swaps] [--acc WEIGHT]
+python -m mocap.solve DETECTIONS.npz rig_info.json OUT.json [--no-align] [--fix-swaps] [--acc WEIGHT] [--vel WEIGHT]
+    [--acc-arms WEIGHT] [--vel-arms WEIGHT] [--trust-front]
 Before fitting, the side view's left and right legs are checked against the front view: a joint has the same height
 in both halves, so if swapping a pair of legs in the side view makes the heights agree better, the side reader
 mixed up the near and far leg and they are swapped back. The same height test gives the sync score: how far apart
 the two halves disagree, and the time lag between them that agrees best.
 
 The fit runs Blender's forward kinematics in torch (pose = parent pose x rest offset x Euler XYZ), with the pelvis
-free to turn and move, every other bone limited to its range, and minimises the confidence-weighted distance between
-the rig's projected joints and the readings in both views, plus smoothness and a small pull toward the rest pose.
+free to turn and move, every other bone limited to its range (and to its twist_deg about its own axis), and minimises
+the confidence-weighted distance between the rig's projected joints and the readings in both views, plus smoothness
+and a small pull toward the rest pose.
+
+--trust-front: where the two halves show a limb at clearly different heights (the video model played a different
+move in each), the side view's reading of that limb is dropped and the front view alone places it, heights included.
+Its depth then comes only from the bone lengths, the joint limits and smoothness: right from the front, a guess from
+the side.
 """
 import json, sys
 
@@ -17,6 +24,8 @@ import torch
 
 from mocap import layout
 
+# a humanoid's arm bones (rig.json names, before _L/_R): --acc-arms and --vel-arms smooth them apart from the body
+ARMS = ("clavicle", "upperarm", "forearm", "hand", "blade")
 LEGS = {"F": ["scap", "shoulder", "elbow", "wrist", "fpaw", "ftoe"], "H": ["hip", "knee", "hock", "hpaw", "htoe"]}
 
 
@@ -49,6 +58,66 @@ def fix_swaps(d, names, margin=4.0):
             d["side_conf"][t, L], d["side_conf"][t, R] = d["side_conf"][t, R].copy(), d["side_conf"][t, L].copy()
         swapped[k] = int(do.sum())
     return swapped
+
+
+def limb_bones(info):
+    """Bone indices of each limb: the bones from a branch point out to a tip (an arm, a leg, the head)."""
+    parent = [b["parent"] for b in info["bones"]]
+    kids = [[i for i, p in enumerate(parent) if p == j] for j in range(len(parent))]
+    out = []
+    for leaf in (i for i in range(len(parent)) if not kids[i]):
+        c = [leaf]
+        while parent[c[-1]] >= 0 and len(kids[parent[c[-1]]]) == 1:
+            c.append(parent[c[-1]])
+        if parent[c[-1]] >= 0:
+            out.append(c)
+    return out
+
+
+def limb_chains(info):
+    """Keypoint indices of each limb (limb_bones)."""
+    kp_bone = [k["bone"] for k in info["keypoints"]]
+    out = [[k for k, b in enumerate(kp_bone) if b in c] for c in limb_bones(info)]
+    return [c for c in out if c]
+
+
+def trust_front(d, info, gap_m=0.12, ok=0.7, pad=2, bridge=5, min_len=3):
+    """Drop the side view's reading of a limb wherever the two views put it at clearly different heights; the front
+    view then places it alone, so its heights count fully. The side reading is replaced (height from the front,
+    across-the-image position carried over from the frames around) only so the starting pose is sane.
+    Returns {keypoint name: [[first, end), ...]} frames dropped, and a (T, K) mask."""
+    T, K = d["front_conf"].shape
+    gap = np.abs(d["front_uv"][..., 1] - d["side_uv"][..., 1]) * layout.M_PER_PX
+    both = (d["front_conf"] > ok) & (d["side_conf"] > ok)
+    mask = np.zeros((T, K), bool)
+    for kps in limb_chains(info):
+        bad = np.nonzero(((gap[:, kps] > gap_m) & both[:, kps]).any(1))[0]
+        spans = []
+        for t in bad:
+            if spans and t - spans[-1][1] <= bridge:
+                spans[-1][1] = t + 1
+            else:
+                spans.append([t, t + 1])
+        for a, b in spans:
+            if b - a >= min_len:
+                mask[max(0, a - pad):min(T, b + pad), kps] = True
+    frames = np.arange(T)
+    for k in range(K):
+        m = mask[:, k]
+        if not m.any():
+            continue
+        d["side_conf"][m, k] = 0
+        d["side_uv"][m, k, 1] = d["front_uv"][m, k, 1]
+        if (~m).any():
+            d["side_uv"][m, k, 0] = np.interp(frames[m], frames[~m], d["side_uv"][~m, k, 0])
+    names = [k["name"] for k in info["keypoints"]]
+    report = {}
+    for k in range(K):
+        idx = np.nonzero(mask[:, k])[0]
+        if len(idx):
+            cuts = np.nonzero(np.diff(idx) > 1)[0]
+            report[names[k]] = [[int(idx[a]), int(idx[b]) + 1] for a, b in zip(np.r_[0, cuts + 1], np.r_[cuts, len(idx) - 1])]
+    return report, mask
 
 
 def height_features(uv, conf, names):
@@ -156,6 +225,13 @@ def euler_xyz(a):
     return Rz @ Ry @ Rx
 
 
+def twist(R):
+    """How far each rotation turns about its bone's own axis (local Y), from its swing-twist split. Euler Y is not
+    this: with the bone swung far, Euler angles trade twist for swing, so their limits don't bound it."""
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    return 2 * torch.atan2(R[..., 0, 2] - R[..., 2, 0], 1 + tr + 1e-9)
+
+
 def axis_angle(v):
     th = v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     k = v / th
@@ -167,7 +243,7 @@ def axis_angle(v):
 
 
 class Rig:
-    def __init__(self, info, dev="cpu"):
+    def __init__(self, info, dev="cpu", roll_weight=1.0):
         self.names = [b["name"] for b in info["bones"]]
         self.parent = [b["parent"] for b in info["bones"]]
         B = torch.tensor([b["matrix_local"] for b in info["bones"]], dtype=torch.float64, device=dev)
@@ -178,6 +254,11 @@ class Rig:
         lim = np.radians(np.array([b["limits_deg"] for b in info["bones"]], float))
         self.lo = torch.tensor(lim[..., 0], device=dev)
         self.hi = torch.tensor(lim[..., 1], device=dev)
+        # twist_deg: the skin pinches where a bone turns far about its own axis (a ribbon past ~90 degrees)
+        self.twist = torch.tensor(np.radians([b.get("twist_deg", 360) for b in info["bones"]]), device=dev)
+        # and nothing in a video shows that turn once the bone's joint is straight (no bend plane to read), so it is
+        # pulled gently toward the rest roll; otherwise it wanders within twist_deg and the skin visibly wrings
+        self.rolls = (self.twist < np.pi).to(self.twist.dtype) * roll_weight
         self.kp = [(k["bone"], k["end"]) for k in info["keypoints"]]
         self.kp_names = [k["name"] for k in info["keypoints"]]
         self.rest_kp = torch.tensor([k["rest"] for k in info["keypoints"]], dtype=torch.float64, device=dev)
@@ -221,7 +302,7 @@ def triangulate(d, front_height_weight=0.25):
     sy = -(d["side_uv"][..., 0] - layout.W_SIDE / 2) * layout.M_PER_PX
     fz = layout.Z_CENTER + (layout.H / 2 - d["front_uv"][..., 1]) * layout.M_PER_PX
     sz = layout.Z_CENTER + (layout.H / 2 - d["side_uv"][..., 1]) * layout.M_PER_PX
-    w1, w2 = front_height_weight * d["front_conf"].clip(1e-3), d["side_conf"].clip(1e-3)
+    w1, w2 = front_height_weight * d["front_conf"].clip(1e-3), d["side_conf"].clip(1e-3)  # weight: scalar or (T, K)
     return np.stack([fx, sy, (fz * w1 + sz * w2) / (w1 + w2)], -1)
 
 
@@ -302,10 +383,58 @@ def ik_init(tri, root_aa, info, rig):
     return eul
 
 
-def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_weight=0.02):
+def refit_limb(rig, t, bones, kps, trans, root, phi, f_obs, f_c, s_obs, s_c, f_axis, err, starts=24, iters=300, better=0.7):
+    """One limb in frame t fitted alone to that frame's readings, from the neighbouring frames' poses and random ones,
+    the rest of the body held. Returns the limb's new phi when it fits better than err (px) by the factor `better`."""
+    T = len(phi)
+    with torch.no_grad():
+        p0 = phi[t].detach().clone()
+        seeds = [phi[u, bones].detach() for u in (t - 1, t + 1) if 0 <= u < T]
+        g = torch.Generator(device="cpu").manual_seed(t)
+        seeds += [torch.randn(len(bones), 3, generator=g, dtype=phi.dtype).to(phi.device) * 1.5
+                  for _ in range(starts - len(seeds))]
+    z = torch.stack(seeds).clone().requires_grad_(True)
+    n = len(z)
+    tr, R = trans[t].detach().expand(n, 3), axis_angle(root[t].detach()).expand(n, 3, 3)
+    fa = f_axis[t, kps] if f_axis.dim() == 3 else f_axis
+    opt = torch.optim.Adam([z], lr=0.05)
+    for _ in range(iters):
+        p = p0.expand(n, *p0.shape).clone()
+        p[:, bones] = z
+        eul = rig.lo + (rig.hi - rig.lo) * torch.sigmoid(p)
+        J, _ = rig.forward(tr, R, eul)
+        pf, ps = project(J)
+        rf = ((pf[:, kps] - f_obs[t, kps]) ** 2 * fa).sum(-1)
+        rs = ((ps[:, kps] - s_obs[t, kps]) ** 2).sum(-1)
+        data = (f_c[t, kps] * torch.log1p(rf / 36) + s_c[t, kps] * torch.log1p(rs / 36)).sum(-1)  # the fit's own, at 6 px
+        tw = twist(euler_xyz(eul[:, bones]))
+        turn = (torch.relu(tw.abs() - rig.twist[bones]) ** 2).sum(1) * 1000
+        roll = (tw ** 2 * rig.rolls[bones]).sum(1)
+        opt.zero_grad()
+        (data + turn + roll).sum().backward()
+        opt.step()
+    with torch.no_grad():
+        ok = f_c[t, kps] + s_c[t, kps] > 0.1
+        e = ((f_c[t, kps] * rf.sqrt() + s_c[t, kps] * rs.sqrt()) / (f_c[t, kps] + s_c[t, kps]).clamp(min=1e-6))[:, ok]
+        e = e.median(1).values
+        i = int((data + turn + roll).argmin())
+    return z[i].detach() if float(e[i]) < better * err and float(turn[i]) < 1 else None
+
+
+def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_weight=0.02, vel_weight=2.0,
+        acc_arms=None, vel_arms=None, reseed_worse=3.0, reseed_floor=20.0, roll_weight=1.0, twist_vel=20.0):
     """acc_weight: the joint-acceleration penalty. Lower it for fast moves with long levers (a blade tip in a slash
-    moves faster than anything else and gets held back first): 0.002 follows them far better."""
-    rig = Rig(info, dev)
+    moves faster than anything else and gets held back first): 0.002 follows them far better.
+    vel_weight: the penalty on every joint turning from one frame to the next. It holds back a whole-arm swing that
+    crosses the body in a few frames even with a low acc_weight: 0.2 lets it through.
+    acc_arms, vel_arms: the same for the arms alone (ARMS), so a slash can be followed loosely while the body stays
+    smooth: video models swing an arm across the body between two frames, and a smoothness low enough to follow
+    that everywhere passes the reader's frame-to-frame noise into the hips and head as a bounce.
+    reseed_worse, reseed_floor: a limb fitting a frame reseed_worse times worse than its median over the clip, and
+    worse than reseed_floor px, is fitted again in that frame from new starts (refit_limb).
+    roll_weight, twist_vel: the pull of twist-limited bones (twist_deg) toward their rest roll, and the penalty on that
+    roll changing from one frame to the next. A loose vel_arms lets a slash through but would let the arm wring too."""
+    rig = Rig(info, dev, roll_weight)
     names = rig.kp_names
     T = len(d["front_uv"])
     f_obs = torch.tensor(d["front_uv"], dtype=torch.float64, device=dev)
@@ -326,11 +455,20 @@ def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_
     phi = torch.logit(z).clone().requires_grad_(True)
     foot = set(feet())
     paws = [i for i, n in enumerate(names) if n in foot or any(n.startswith(p) for p in ("fpaw", "ftoe", "hpaw", "htoe"))]
+    arm_b = [i for i, n in enumerate(rig.names) if n.rsplit("_", 1)[0] in ARMS]
+    # the elbow out: the shoulder joint sits on the torso, and following it loosely would shake the body
+    arm_k = [i for i, (b, e) in enumerate(rig.kp) if b in arm_b and not (e == "head" and rig.names[b].rsplit("_", 1)[0] in ARMS[:2])]
+    acc_w = torch.full((len(names),), acc_weight, dtype=torch.float64, device=dev)
+    acc_w[arm_k] = acc_weight if acc_arms is None else acc_arms
+    vel_w = torch.full((nb,), vel_weight, dtype=torch.float64, device=dev)
+    vel_w[arm_b] = vel_weight if vel_arms is None else vel_arms
+    vel_w = vel_w.expand(max(T - 1, 0), nb).clone()  # per step between frames, so a step can be let go
     sigma = 6.0  # px, robust scale (annealed down from 40 px so far-off joints still pull early on)
     # The side view sees legs swing and the hips clearly; the front view foreshortens leg lifts and hides the hips
     # when the creature sits, and video models animate it less faithfully. So heights come mostly from the side
     # view and the front view mainly supplies left-right position.
-    f_axis = torch.tensor([1.0, front_height_weight], dtype=torch.float64, device=dev)
+    fhw = torch.as_tensor(front_height_weight, dtype=torch.float64, device=dev)
+    f_axis = torch.stack(torch.broadcast_tensors(torch.ones_like(fhw), fhw), -1)  # (2,) or (T, K, 2)
 
     def loss_fn(stage):
         nonlocal sigma
@@ -340,12 +478,16 @@ def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_
         rf = ((pf - f_obs) ** 2 * f_axis).sum(-1)
         rs = ((ps - s_obs) ** 2).sum(-1)
         data = (f_c * torch.log1p(rf / sigma ** 2)).sum() + (s_c * torch.log1p(rs / sigma ** 2)).sum()
-        acc = ((J[2:] - 2 * J[1:-1] + J[:-2]) ** 2).sum() / layout.M_PER_PX ** 2 * acc_weight
-        vel = ((eul[1:] - eul[:-1]) ** 2).sum() * 2.0 + ((root[1:] - root[:-1]) ** 2).sum() * 2.0
+        acc = (((J[2:] - 2 * J[1:-1] + J[:-2]) ** 2).sum((0, 2)) * acc_w).sum() / layout.M_PER_PX ** 2
+        vel = (((eul[1:] - eul[:-1]) ** 2).sum(2) * vel_w).sum() + ((root[1:] - root[:-1]) ** 2).sum() * vel_weight
         prior = (eul ** 2).sum() * 0.05
         ground = (torch.relu(-J[:, paws, 2]) ** 2).sum() / layout.M_PER_PX ** 2 * 0.5
-        total = data + acc + vel + prior + ground
-        return total, {"data": data.item(), "acc": acc.item(), "vel": vel.item(), "prior": prior.item(), "ground": ground.item()}, J, pf, ps, eul
+        tw = twist(euler_xyz(eul))
+        turn = (torch.relu(tw.abs() - rig.twist) ** 2).sum() * 1000 + (tw ** 2 * rig.rolls).sum() \
+            + (((tw[1:] - tw[:-1]) ** 2) * (vel_w > 0) * rig.rolls).sum() * twist_vel
+        total = data + acc + vel + prior + ground + turn
+        return total, {"data": data.item(), "acc": acc.item(), "vel": vel.item(), "prior": prior.item(), "ground": ground.item(),
+                       "twist": turn.item()}, J, pf, ps, eul
 
     opt = torch.optim.Adam([{"params": [trans], "lr": 0.01}, {"params": [root], "lr": 0.03}, {"params": [phi], "lr": 0.05}])
     for it in range(iters):
@@ -360,6 +502,55 @@ def fit(d, info, iters=1500, dev="cpu", log=True, front_height_weight=0.25, acc_
         if log and it % 250 == 0:
             print(f"  iter {it} loss {total.item():.1f}", {k: round(v, 1) for k, v in parts.items()}, flush=True)
     sigma = 6.0
+    # A limb can settle on the wrong one of two poses (an arm swung through pointing at the camera, fitted folded) and
+    # smoothness keeps it there. Where a limb fits a frame far worse than it does the rest of the clip, it is fitted
+    # again in that frame alone from several starts (the frames either side, random), and the whole clip refined
+    # around it with the new pose held (left free, smoothness would pull it back to the old one) and the angle
+    # smoothness to the frames either side let go (the same arm can sit at far-apart joint angles a frame apart).
+    with torch.no_grad():
+        _, _, J, pf, ps, _ = loss_fn(iters)
+        err = (f_c * (pf - f_obs).norm(dim=-1) + s_c * (ps - s_obs).norm(dim=-1)) / (f_c + s_c).clamp(min=1e-6)
+    redone = []
+    hold = torch.zeros(phi.shape, dtype=torch.bool, device=dev)
+    again = []
+    for bones in limb_bones(info):
+        kps = [k for k, (b, _) in enumerate(rig.kp) if b in bones]
+        if not kps:
+            continue
+        # the median over the limb's joints: one bad reading (a blade tip lost in the blur) doesn't make a bad fit
+        e = torch.where(f_c[:, kps] + s_c[:, kps] > 0.1, err[:, kps], torch.nan).nanmedian(1).values.nan_to_num(0)
+        for t in torch.nonzero(e > max(reseed_worse * float(e.median()), reseed_floor)).flatten().tolist():
+            got = refit_limb(rig, t, bones, kps, trans, root, phi, f_obs, f_c, s_obs, s_c, f_axis, float(e[t]))
+            if got is not None:
+                with torch.no_grad():
+                    phi[t, bones] = got
+                hold[t, bones] = True
+                vel_w[max(t - 1, 0):t + 1, bones] = 0  # its joint angles may jump: the pose is a different branch
+                again.append((bones, kps, t))
+                redone.append((f"{rig.names[bones[-1]]}..{rig.names[bones[0]]}", t))
+    if redone:
+        if log:
+            print("  limbs fitted again from new starts (limb, frame):", redone, flush=True)
+        for g in opt.param_groups:
+            g["lr"] *= 0.5
+        held = phi.detach()[hold].clone()
+        for it in range(iters // 4):
+            total, parts, J, pf, ps, eul = loss_fn(it)
+            opt.zero_grad()
+            total.backward()
+            opt.step()
+            with torch.no_grad():
+                phi[hold] = held
+        # the body has moved under the held limbs: fit them once more to it
+        with torch.no_grad():
+            _, _, J, pf, ps, _ = loss_fn(iters)
+            err = (f_c * (pf - f_obs).norm(dim=-1) + s_c * (ps - s_obs).norm(dim=-1)) / (f_c + s_c).clamp(min=1e-6)
+        for bones, kps, t in again:
+            e = err[t, kps][f_c[t, kps] + s_c[t, kps] > 0.1].median()
+            got = refit_limb(rig, t, bones, kps, trans, root, phi, f_obs, f_c, s_obs, s_c, f_axis, float(e), better=1.0)
+            if got is not None:
+                with torch.no_grad():
+                    phi[t, bones] = got
     with torch.no_grad():
         total, parts, J, pf, ps, eul = loss_fn(iters)
         err_f = (pf - f_obs).norm(dim=-1)
@@ -414,12 +605,22 @@ def main():
     sync["paw_agreement"] = paws
     sync["front_shift_frames"] = None if shift is None else shift.round(2).tolist()
     acc = float(sys.argv[sys.argv.index("--acc") + 1]) if "--acc" in sys.argv else 0.02
-    res = fit(d, info, dev="cuda" if torch.cuda.is_available() else "cpu", acc_weight=acc)
+    opt = lambda k, default: float(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else default
+    vel = opt("--vel", 2.0)
+    trusted, fhw = {}, 0.25
+    if "--trust-front" in sys.argv:
+        trusted, mask = trust_front(d, info)
+        fhw = np.where(mask, 1.0, 0.25)
+        print(f"front view trusted alone for {len(trusted)} joints, {int(mask.any(1).sum())} frames:",
+              {n: s for n, s in trusted.items()})
+    res = fit(d, info, dev="cuda" if torch.cuda.is_available() else "cpu", acc_weight=acc, vel_weight=vel,
+              acc_arms=opt("--acc-arms", None), vel_arms=opt("--vel-arms", None),
+              roll_weight=opt("--roll", 1.0), twist_vel=opt("--twist-vel", 20.0), front_height_weight=fhw)
     print("reprojection error px:", {k: round(v, 2) for k, v in res["reproj_px"].items()})
     motion = {"fps": float(raw["fps"]), "bones": res["bones"], "trans": res["trans"].round(5).tolist(),
               "root_quat": to_quat(res["root_rotmat"]).round(6).tolist(), "euler": res["euler"].round(5).tolist(),
               "joints": res["joints"].round(4).tolist(), "joint_names": res["joint_names"],
-              "reproj_px": res["reproj_px"], "sync": sync, "swaps": swapped}
+              "reproj_px": res["reproj_px"], "sync": sync, "swaps": swapped, "trusted_front": trusted}
     json.dump(motion, open(out, "w"))
     print("saved", out)
 

@@ -14,6 +14,10 @@ if [ "${2:-}" = preview ]; then
 fi
 $BLENDER -b -P blender/build_rig.py -- "$a/prep/static.blend" "$a/rig.json" "$a/rigged" \
   | grep -E "merged|without weights|smoothed|painted|saved|Error" || true
+# long hair (creature.json "hair"): its own mesh and spring bones (blender/add_hair.py), rigged/springs.json
+if $PY -c "import json, sys; sys.exit('hair' not in json.load(open(sys.argv[1])))" "$a/creature.json"; then
+  $BLENDER -b -P blender/add_hair.py -- "$a/rigged/rigged.blend" "$a/creature.json" | grep -E "^hair|strands|split|Error" || true
+fi
 $BLENDER -b -P blender/render_ref.py -- "$a/rigged/rigged.blend" "$R/ref" | grep -E "Error" || true
 $PY tools/compose_ref.py "$R/ref"
 echo "test pose: $a/rigged/testpose_front.png, testpose_side.png"

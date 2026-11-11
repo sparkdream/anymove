@@ -54,7 +54,22 @@ Metres in the prepped mesh's frame: the creature faces -Y, its left is +X, Z is 
 - `limits_deg`: per bone name, or per stem without `_L`/`_R`: [[x lo, x hi], [y lo, y hi], [z lo, z hi]] in degrees.
   Local X is the bending axis (world X for bones in the body's plane), Y runs along the bone (twist: small for spine
   and legs, ±8-20; arms can need ±40), Z swings sideways. Limits shape the training poses as well as the fit: too wide
-  and the reader learns impossible poses, too narrow and it can't read the move.
+  and the reader learns impossible poses, too narrow and it can't read the move. Limits count from the rest pose, not
+  from a straight limb: an elbow bent 67 degrees at rest straightens at X = +65, so [-80, 60] (not [-140, 10]).
+- `hair` (optional, in creature.json): long hair gets its own mesh and spring bones after the build
+  (blender/add_hair.py: found by its texture colour, kept off the arms, simulated by apply_motion --springs). `{}` uses
+  the defaults; override e.g. `{"strands": 8, "max_value": 0.3}` for lighter or darker hair.
+- `twist_deg` (optional): per bone or stem, the most a bone may turn about its own axis, e.g.
+  `{"upperarm": 50, "forearm": 45}`. Euler Y doesn't bound it once a bone swings far (an arm across the chest), and a
+  long bone twisted much past this pinches its skin at the joint, down to a flat ribbon near 90 degrees. Within it the
+  solver pulls these bones toward their rest roll and keeps the roll smooth (mocap.solve `--roll 1 --twist-vel 20`):
+  a straight elbow shows no bend plane, so a video can't fix the roll, and left free it wrings the arm.
+- `grip_deg` (optional): per held-prop bone, e.g. `{"blade": 45}`. The prop (whatever lies on its axis outside the
+  fist: blade, guard, pommel) is turned in the rest mesh to sit that many degrees off its hand, cut from the fingers,
+  and weighted to the hand alone, so it never bends or slides in the grip and the wrist does the turning. Use it when
+  the generator put a dagger in a hammer grip square to the forearm but the moves hold it along the arm: with 45 and
+  the palm down, a 45-degree wrist bend lays it parallel. Give the prop bone small limits (±3) so its tip reading
+  turns the hand.
 
 Place joints from the grid views. After each edit:
 

@@ -6,6 +6,9 @@ blender -b -P blender/apply_motion.py -- rigged.blend rig_info.json motion.json 
   --paint                    keep the leg paint (the exam needs it; the showcase does not)
   --blur                     motion blur from the keyframes, like a video model's fast limbs
   --glb                      export out_dir/animation.glb
+  --anim-only                with --glb: the skeleton and its animation only, no mesh (a game's clip, played on the
+                             character exported from the same rig)
+  --action NAME              with --glb: the animation's name in the GLB (default: Blender's action name)
   --frames 10,40,80          render only these frames (stills), for quick comparisons
   --springs fur.json         simulate the fur bones (blender/add_fur_bones.py) as damped springs
   --scale 0.75               render at this fraction of the layout size
@@ -34,6 +37,7 @@ scene = bpy.context.scene
 info = json.load(open(info_path))
 motion = json.load(open(motion_path))
 rig, body = bpy.data.objects["rig"], bpy.data.objects["body"]
+meshes = [o for o in bpy.data.objects if o.type == "MESH" and o.find_armature() == rig]  # the body, and hair split off
 names = motion["bones"]
 T = len(motion["euler"])
 fps = motion.get("fps", 24)
@@ -42,9 +46,10 @@ scene.render.fps_base = round(fps) / fps
 scene.frame_start, scene.frame_end = 0, T - 1
 
 if "--paint" not in opts:
-    attr = body.data.color_attributes["legpaint"]
-    rgba = np.zeros(len(attr.data) * 4)
-    attr.data.foreach_set("color", rgba)
+    for o in meshes:
+        attr = o.data.color_attributes.get("legpaint")
+        if attr:
+            attr.data.foreach_set("color", np.zeros(len(attr.data) * 4))
 
 root = names[0]
 B = rig.data.bones[root].matrix_local.to_3x3()
@@ -78,42 +83,54 @@ if opt("--springs"):
     for name in springs:
         b = rig.data.bones[name]
         rest_world[name] = (rig.matrix_world.to_3x3() @ (b.tail_local - b.head_local)).normalized()
+    # a chain (hair) poses root first: a bone whose parent is a spring reads that parent's new pose
+    depth = {}
+    for name in springs:
+        p, k = springs[name].get("parent"), 0
+        while p in springs:
+            p, k = springs[p].get("parent"), k + 1
+        depth[name] = k
+    levels = [[n for n in springs if depth[n] == k] for k in range(max(depth.values()) + 1)]
     for t in range(T):
         scene.frame_set(t)
-        for name, s in springs.items():
-            pb = rig.pose.bones[name]
-            par = pb.parent
-            rigid = rig.matrix_world @ par.matrix @ (par.bone.matrix_local.inverted() @ pb.bone.matrix_local)
-            L = pb.bone.length
-            head = rigid.translation.copy()
-            rdir = (rigid @ Vector((0, L, 0)) - head).normalized()
-            gdir = rdir.slerp(rest_world[name], s.get("gravity", 0.0))
-            target = head + gdir * L
-            if name not in state:
-                state[name] = {"x": target.copy(), "v": Vector((0, 0, 0)), "h": head, "g": target}
-            st = state[name]
-            w = 2 * math.pi * s["freq"]
-            k, c = w * w, 2 * s["damping"] * w
-            cos_max = math.cos(math.radians(s["max_deg"]))
-            for i in range(1, sub + 1):
-                a = i / sub
-                h, g = st["h"].lerp(head, a), st["g"].lerp(target, a)
-                st["v"] += (k * (g - st["x"]) - c * st["v"]) * dt
-                st["x"] += st["v"] * dt
-                d = (st["x"] - h).normalized()
-                gd = (g - h).normalized()
-                if d.dot(gd) < cos_max:  # past the swing limit: put it on the cone's edge
-                    axis = gd.cross(d).normalized()
-                    d = gd.copy()
-                    d.rotate(Quaternion(axis, math.radians(s["max_deg"])))
-                st["x"] = h + d * L
-            st["h"], st["g"] = head, target
-            final = (st["x"] - head).normalized()
-            swing[name].append(math.degrees(math.acos(max(-1.0, min(1.0, final.dot(rdir))))))
-            local = rigid.to_3x3().inverted() @ final
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = Vector((0, 1, 0)).rotation_difference(local)
-            pb.keyframe_insert("rotation_quaternion", frame=t)
+        for lv, level in enumerate(levels):
+            if lv:
+                bpy.context.view_layer.update()
+            for name in level:
+                s = springs[name]
+                pb = rig.pose.bones[name]
+                par = pb.parent
+                rigid = rig.matrix_world @ par.matrix @ (par.bone.matrix_local.inverted() @ pb.bone.matrix_local)
+                L = pb.bone.length
+                head = rigid.translation.copy()
+                rdir = (rigid @ Vector((0, L, 0)) - head).normalized()
+                gdir = rdir.slerp(rest_world[name], s.get("gravity", 0.0))
+                target = head + gdir * L
+                if name not in state:
+                    state[name] = {"x": target.copy(), "v": Vector((0, 0, 0)), "h": head, "g": target}
+                st = state[name]
+                w = 2 * math.pi * s["freq"]
+                k, c = w * w, 2 * s["damping"] * w
+                cos_max = math.cos(math.radians(s["max_deg"]))
+                for i in range(1, sub + 1):
+                    a = i / sub
+                    h, g = st["h"].lerp(head, a), st["g"].lerp(target, a)
+                    st["v"] += (k * (g - st["x"]) - c * st["v"]) * dt
+                    st["x"] += st["v"] * dt
+                    d = (st["x"] - h).normalized()
+                    gd = (g - h).normalized()
+                    if d.dot(gd) < cos_max:  # past the swing limit: put it on the cone's edge
+                        axis = gd.cross(d).normalized()
+                        d = gd.copy()
+                        d.rotate(Quaternion(axis, math.radians(s["max_deg"])))
+                    st["x"] = h + d * L
+                st["h"], st["g"] = head, target
+                final = (st["x"] - head).normalized()
+                swing[name].append(math.degrees(math.acos(max(-1.0, min(1.0, final.dot(rdir))))))
+                local = rigid.to_3x3().inverted() @ final
+                pb.rotation_mode = "QUATERNION"
+                pb.rotation_quaternion = Vector((0, 1, 0)).rotation_difference(local)
+                pb.keyframe_insert("rotation_quaternion", frame=t)
     print("springs simulated (swing from the sculpted direction, mean / max deg):",
           {n: (round(sum(v) / len(v), 1), round(max(v), 1)) for n, v in swing.items()})
 
@@ -195,9 +212,12 @@ if views:
         print("rendered", v, flush=True)
 
 if "--glb" in opts:
+    if opt("--action"):
+        rig.animation_data.action.name = opt("--action")
     bpy.ops.object.select_all(action="DESELECT")
     rig.select_set(True)
-    body.select_set(True)
+    for o in meshes if "--anim-only" not in opts else []:
+        o.select_set(True)
     for o in list(scene.objects):
         if o.type in ("CAMERA", "LIGHT"):
             o.select_set(False)
